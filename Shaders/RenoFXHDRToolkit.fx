@@ -36,6 +36,10 @@
 #define GAMUT_TARGET_BT709  2
 #define GAMUT_TARGET_BT2020 3
 
+#define GAMMA_CORRECTION_OFF 0
+#define GAMMA_CORRECTION_22  1
+#define GAMMA_CORRECTION_24  2
+
 #define SATURATION_OKLAB      0
 #define SATURATION_WORKING_YF 1
 
@@ -218,10 +222,10 @@ uniform float TONEMAP_PEAK_NITS <
 uniform uint GAMMA_CORRECTION <
 	ui_type = "combo";
 	ui_category = "Output";
-	ui_items = "Off\0Gamma 2.2\0";
+	ui_items = "Off\0Gamma 2.2\0Gamma 2.4\0";
 	ui_label = "SDR EOTF Emulation";
-	ui_tooltip = "Emulates the look of an sRGB game viewed on a gamma 2.2 display. This is how most games are made.\nIf you're using this on a native HDR game and it already uses the correct gamma, set this off.";
-> = 0;
+	ui_tooltip = "Emulates the look of an sRGB game viewed on an SDR display at either 2.2 or 2.4. 2.2 is correct for most games.\nIf you're using this on a native HDR game and it already uses the correct gamma, set this off.";
+> = GAMMA_CORRECTION_22;
 
 uniform uint SHOW_PEAK_BRIGHTNESS <
 	ui_type = "combo";
@@ -399,6 +403,14 @@ uniform uint TONEMAP_SPACE <
 	ui_label = "Tone Map Working Space";
 	ui_tooltip = "Changes how bright values are controlled. LMS is the recommended default. Yf preserves color balance. Brightest Channel protects the strongest channel and scales the others with it.";
 > = SPACE_LMS;
+
+uniform uint GAMMA_CORRECTION_WORKING_SPACE <
+	ui_type = "combo";
+	ui_category = "Advanced";
+	ui_items = "BT.709\0BT.2020\0AP1 (ACEScg)\0LMS (Stockman-Sharpe)\0Yf (Brightness)\0";
+	ui_label = "Gamma Correction Working Space";
+	ui_tooltip = "Select the working space used by gamma correction when enabled. BT.709 is the correct choice to emulate the screen's behavior, but other working spaces may be visually preferrable.";
+> = SPACE_BT709;
 
 uniform uint SATURATION_SPACE <
 	ui_type = "combo";
@@ -1137,6 +1149,13 @@ float Neutwo(float value, float peak, float clip) {
 	return numerator * rsqrt(max(denominator_squared, 1e-12f));
 }
 
+float3 Neutwo(float3 value, float3 peak, float3 clip) {
+	return float3(
+		Neutwo(value.r, peak.r, clip.r),
+		Neutwo(value.g, peak.g, clip.g),
+		Neutwo(value.b, peak.b, clip.b));
+}
+
 float WhiteClipFromGradingPeak(float3 peak_white) {
 	if (GRADING_SPACE == SPACE_YF) {
 		return max(peak_white.r, max(peak_white.g, peak_white.b));
@@ -1159,11 +1178,18 @@ float3 ApplyNeutwo(float3 bt709, float white_clip) {
 		output_peak = max(TONEMAP_PEAK_NITS / game_nits, 1.0f);
 	}
 	float peak = output_peak;
-	if (output_transfer != OUTPUT_SRGB && GAMMA_CORRECTION != 0) {
-		peak = SRGBDecode(SignPow(output_peak, 1.0f / 2.2f));
+	float3 peak3 = float3(peak, peak, peak);
+	if (output_transfer != OUTPUT_SRGB && GAMMA_CORRECTION != GAMMA_CORRECTION_OFF) {
+		if (GAMMA_CORRECTION == GAMMA_CORRECTION_24) {
+			peak = SRGBDecode(SignPow(output_peak, 1.0f / 2.4f));
+		} else {
+			peak = SRGBDecode(SignPow(output_peak, 1.0f / 2.2f));
+		}
+		peak3 = float3(peak, peak, peak);
 	}
 	if (white_clip <= peak) return bt709;
 	float clip = max(white_clip, peak);
+	float3 clip3 = max(white_clip.xxx, peak3);
 
 	if (TONEMAP_SPACE == SPACE_YF) {
 		float white_yf = max(YfWhite(), 1e-6f);
@@ -1389,10 +1415,55 @@ float3 ApplyGamutCompression(float3 bt709) {
 	return mul(LMS_TO_BT709, final_lms);
 }
 
-float3 ApplyGamma22Correction(float3 bt709) {
-	// Convert an sRGB-reference presentation to the light produced by a gamma
-	// 2.2 display, while preserving signed extended-range values.
-	return SignPow(SRGBEncode(bt709), 2.2f);
+float3 ApplyGammaCorrectionBT709(float3 bt709, float gamma) {
+	return SignPow(SRGBEncode(bt709), gamma);
+}
+
+float3 ApplyGammaCorrectionBT2020(float3 bt709, float gamma) {
+	float3 bt2020 = mul(BT709_TO_BT2020, bt709);
+	bt2020 = SignPow(SRGBEncode(bt2020), gamma);
+	return mul(BT2020_TO_BT709, bt2020);
+}
+
+float3 ApplyGammaCorrectionAP1(float3 bt709, float gamma) {
+	float3 ap1 = mul(BT709_TO_AP1, bt709);
+	ap1 = SignPow(SRGBEncode(ap1), gamma);
+	return mul(AP1_TO_BT709, ap1);
+}
+
+float3 ApplyGammaCorrectionLMS(float3 bt709, float gamma) {
+	float3 lms = mul(BT709_TO_LMS, bt709);
+	float3 white = WorkingWhite(SPACE_LMS);
+	float3 normalized = DivideSafe(lms, white, 0.0f);
+	normalized = SignPow(SRGBEncode(normalized), gamma);
+	normalized *= white;
+	return mul(LMS_TO_BT709, normalized);
+}
+
+float3 ApplyGammaCorrectionYf(float3 bt709, float gamma) {
+	float white_yf = max(YfWhite(), 1e-6f);
+	float source_yf = max(YfFromBT709(bt709), 0.0f);
+	float normalized_yf = source_yf / white_yf;
+	float mapped_yf = SignPow(SRGBEncode(normalized_yf), gamma) * white_yf;
+	return ScaleToYf(bt709, source_yf, mapped_yf);
+}
+
+float3 ApplyGammaCorrection(float3 bt709) {
+	float gamma = GAMMA_CORRECTION == GAMMA_CORRECTION_24 ? 2.4f : 2.2f;
+	uint working_space = GAMMA_CORRECTION_WORKING_SPACE;
+	if (working_space == SPACE_BT2020) {
+		return ApplyGammaCorrectionBT2020(bt709, gamma);
+	}
+	if (working_space == SPACE_AP1) {
+		return ApplyGammaCorrectionAP1(bt709, gamma);
+	}
+	if (working_space == SPACE_LMS) {
+		return ApplyGammaCorrectionLMS(bt709, gamma);
+	}
+	if (working_space == SPACE_YF) {
+		return ApplyGammaCorrectionYf(bt709, gamma);
+	}
+	return ApplyGammaCorrectionBT709(bt709, gamma);
 }
 
 float2 DaylightChromaticityFromKelvin(float kelvin) {
@@ -1461,8 +1532,8 @@ float3 PrepareOutputLinear(
 	uint output_transfer = ResolveOutputTransfer();
 	bt709 = ApplyNeutwo(bt709, white_clip);
 
-	if (output_transfer != OUTPUT_SRGB && GAMMA_CORRECTION != 0) {
-		bt709 = ApplyGamma22Correction(bt709);
+	if (output_transfer != OUTPUT_SRGB && GAMMA_CORRECTION != GAMMA_CORRECTION_OFF) {
+		bt709 = ApplyGammaCorrection(bt709);
 	}
 	bt709 = ApplyColorTemperature(bt709, color_temperature_adaptation);
 
