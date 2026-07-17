@@ -1,0 +1,72 @@
+# Ignore Visual Studio temporary files, build results, and user-specific files
+*.obj
+*.exe
+*.dll
+*.pdb
+*.idb
+*.class
+*.cache
+*.ilk
+*.log
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+*.dbmdl
+*.opendb
+*.VC.opendb
+*.ncb
+*.sdf
+*.opensdf
+*.unsuccessfulbuild
+*.tlog
+*.lastbuildstate
+*.htm
+*.html
+*.vspscc
+*.vssscc
+*.tmp
+*.temp
+*.diff
+*.patch
+
+# Ignore Visual Studio Code settings and local workspace files
+.vscode/
+.history/
+
+# Ignore macOS files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Ignore Windows thumbnail and temp files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Ignore compiled shader binaries and intermediate assets
+*.spv
+*.cso
+*.ilk
+*.sbr
+
+# Ignore build output folders
+bin/
+obj/
+
+# Ignore global Git files
+*.orig
+
+# Ignore crash dumps
+*.dmp
+
+# Ignore any local environment files
+.env
+
+# Keep shader source and repository files tracked
+!Shaders/**/*.fx
+README.md
+LICENSE
