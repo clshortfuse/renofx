@@ -313,17 +313,6 @@ uniform float SATURATION <
 	ui_tooltip = "Controls overall color strength. 50 is unchanged; lower values reduce color and higher values make colors more vivid.";
 > = 50.0;
 
-uniform float COLOR_TEMPERATURE_KELVIN <
-	ui_type = "slider";
-	ui_category = "Color Grading";
-	ui_min = 4000.0;
-	ui_max = 9300.0;
-	ui_step = 100.0;
-	ui_units = " K";
-	ui_label = "White Point";
-	ui_tooltip = "Adjusts the image white point using Bradford chromatic adaptation. 6500 K is neutral; higher values are cooler and lower values are warmer.";
-> = 6500.0;
-
 uniform float HIGHLIGHT_SATURATION <
 	ui_type = "slider";
 	ui_category = "Color Grading";
@@ -353,6 +342,17 @@ uniform float FLARE <
 	ui_label = "Flare";
 	ui_tooltip = "Lifts very dark areas and softens their contrast, similar to light spreading through a camera lens. Zero turns it off.";
 > = 0.0;
+
+uniform float COLOR_TEMPERATURE_KELVIN <
+	ui_type = "slider";
+	ui_category = "Color Grading";
+	ui_min = 4000.0;
+	ui_max = 9300.0;
+	ui_step = 100.0;
+	ui_units = " K";
+	ui_label = "White Point";
+	ui_tooltip = "Adjusts the image white point using Bradford chromatic adaptation. 6500 K is neutral; higher values are cooler and lower values are warmer.";
+> = 6500.0;
 
 uniform float GRADING_MID_GRAY <
 	ui_type = "slider";
