@@ -1,6 +1,6 @@
 #include "ReShade.fxh"
 
-// Standalone image grading and presentation effect.
+// Image grading and presentation effect with optional split scene/UI output.
 // SDR input uses BT.709. HDR10 input is decoded from BT.2020 PQ into the
 // normalized linear BT.709 representation used by the processing pipeline.
 
@@ -14,13 +14,18 @@
 #define INPUT_AUTO   0
 #define INPUT_LINEAR 1
 #define INPUT_SRGB   2
-#define INPUT_HDR10  3
-#define INPUT_SCRGB  4
+#define INPUT_GAMMA22 3
+#define INPUT_BT1886  4
+#define INPUT_HDR10  5
+#define INPUT_SCRGB  6
 
-#define OUTPUT_AUTO   0
-#define OUTPUT_SRGB   1
-#define OUTPUT_HDR10  2
-#define OUTPUT_SCRGB  3
+#define OUTPUT_AUTO    0
+#define OUTPUT_LINEAR  1
+#define OUTPUT_SRGB    2
+#define OUTPUT_GAMMA22 3
+#define OUTPUT_BT1886  4
+#define OUTPUT_HDR10   5
+#define OUTPUT_SCRGB   6
 
 #define COLOR_SPACE_UNKNOWN   0
 #define COLOR_SPACE_SRGB      1
@@ -159,12 +164,14 @@ uniform bool INSTRUCTIONS_TEXT <
 	noreset = 1;
 > = false;
 
+uniform uint FRAME_COUNT < source = "framecount"; >;
+
 uniform uint INPUT_TRANSFER <
 	ui_type = "combo";
 	ui_category = "Input";
-	ui_items = "Auto\0Linear (SDR)\0sRGB (SDR)\0HDR10 (HDR)\0scRGB (HDR)\0";
+	ui_items = "Auto\0Linear (SDR)\0sRGB (SDR)\0Gamma 2.2 (SDR)\0BT.1886 (SDR)\0HDR10 (HDR)\0scRGB (HDR)\0";
 	ui_label = "Input Transfer";
-	ui_tooltip = "Auto detects HDR10 or scRGB from the color space reported to ReShade and uses sRGB for SDR or unknown input. Use a manual choice only if Auto produces incorrect colors or brightness.";
+	ui_tooltip = "Auto detects HDR10 or scRGB from the color space reported to ReShade and uses sRGB for SDR or unknown input. Gamma 2.2 is for properly encoded SDR games. BT.1886 uses gamma 2.4 and is for video content or a very small selection of games.";
 > = INPUT_AUTO;
 
 uniform float INPUT_SCALING_NITS <
@@ -192,9 +199,9 @@ uniform float MAX_INPUT_WHITE_NITS <
 uniform uint OUTPUT_TRANSFER <
 	ui_type = "combo";
 	ui_category = "Output";
-	ui_items = "Auto\0sRGB\0HDR10 (BT.2020 PQ)\0scRGB (BT.709 Linear)\0";
+	ui_items = "Auto\0Linear (SDR)\0sRGB (SDR)\0Gamma 2.2 (SDR)\0BT.1886 (SDR)\0HDR10 (BT.2020 PQ)\0scRGB (BT.709 Linear)\0";
 	ui_label = "Output Transfer";
-	ui_tooltip = "Auto detects the display mode reported to ReShade. Use a manual choice only if Auto produces incorrect colors or brightness.";
+	ui_tooltip = "Auto detects the display mode reported to ReShade. Linear passes SDR output through without transfer encoding. Gamma 2.2 is for properly encoded SDR games. BT.1886 uses gamma 2.4 and is for video content or a very small selection of games.";
 > = OUTPUT_AUTO;
 
 uniform float GAME_BRIGHTNESS_NITS <
@@ -204,8 +211,8 @@ uniform float GAME_BRIGHTNESS_NITS <
 	ui_max = 500.0;
 	ui_step = 1.0;
 	ui_units = " nits";
-	ui_label = "Output Scaling";
-	ui_tooltip = "Sets the HDR reference-white brightness for HDR10 and scRGB output. This setting does not affect sRGB output.";
+	ui_label = "Game Brightness";
+	ui_tooltip = "Sets scene reference white for HDR10 and scRGB output. In split mode this scales the game independently from the UI. This setting does not affect SDR output.";
 > = 100.0;
 
 uniform float TONEMAP_PEAK_NITS <
@@ -222,9 +229,9 @@ uniform float TONEMAP_PEAK_NITS <
 uniform uint GAMMA_CORRECTION <
 	ui_type = "combo";
 	ui_category = "Output";
-	ui_items = "Off\0Gamma 2.2\0Gamma 2.4\0";
+	ui_items = "Off\0Gamma 2.2\0BT.1886\0";
 	ui_label = "SDR EOTF Emulation";
-	ui_tooltip = "Emulates the look of an sRGB game viewed on an SDR display at either 2.2 or 2.4. 2.2 is correct for most games.\nIf you're using this on a native HDR game and it already uses the correct gamma, set this off.";
+	ui_tooltip = "Emulates an SDR display EOTF for HDR output. Gamma 2.2 is for properly encoded SDR games. BT.1886 uses gamma 2.4 and is for video content or a very small selection of games. This setting is skipped for SDR output and when Input Transfer is Gamma 2.2 or BT.1886.\nIf you're using this on a native HDR game and it already uses the correct gamma, set this off.";
 > = GAMMA_CORRECTION_22;
 
 uniform uint SHOW_PEAK_BRIGHTNESS <
@@ -234,6 +241,24 @@ uniform uint SHOW_PEAK_BRIGHTNESS <
 	ui_label = "Show Estimated Peak";
 	ui_tooltip = "Shows the estimated output brightness of Max Input White after inverse tone mapping and brightness grading. The estimate does not include APL limiting.";
 > = 0;
+
+uniform bool SEPARATE_SCENE_UI_SCALING <
+	ui_type = "checkbox";
+	ui_category = "RenoDX Pipeline Insert";
+	ui_label = "Use RenoDX Pipeline Insert";
+	ui_tooltip = "Requires renodx-upgrade.addon. This will allow you to insert the first pass before the UI renders, and finalize with the final output pass. This enables control of the image before the UI, as well as separate UI scaling.";
+> = false;
+
+uniform float UI_BRIGHTNESS_NITS <
+	ui_type = "slider";
+	ui_category = "RenoDX Pipeline Insert";
+	ui_min = 1.0;
+	ui_max = 500.0;
+	ui_step = 1.0;
+	ui_units = " nits";
+	ui_label = "UI Brightness";
+	ui_tooltip = "Sets graphics/UI reference white for HDR10 and scRGB output when Separate Scene/UI Scaling is enabled. This setting does not affect sRGB output.";
+> = 100.0;
 
 uniform float HDR_BOOST <
 	ui_type = "slider";
@@ -439,15 +464,56 @@ sampler2D APLSampler {
 // Frame-global values calculated once after the APL mip chain is available.
 // Texel 0 stores grading-space peak white in RGB and scene-dependent HDR Boost
 // availability in alpha. Texel 1 stores the APL-independent overlay peak nits
-// in red and the Bradford color-temperature adaptation in GBA.
+// in red and the Bradford color-temperature adaptation in GBA. Texel 2 stores
+// the inserted permutation's resolved game/intermediate transfer and scaling
+// in RG. Blue indicates that the processed scene was copied into an RGBA16F
+// target, while alpha indicates authoritative presentation-target metadata.
+// Texel 3 provides a current-frame and matching-dimensions handshake so the
+// final pass never consumes stale state or a differently sized handoff.
 texture2D FrameStateTexture {
-	Width = 2;
+	Width = 4;
 	Height = 1;
 	Format = RGBA32F;
 };
 
 sampler2D FrameStateSampler {
 	Texture = FrameStateTexture;
+	MinFilter = POINT;
+	MagFilter = POINT;
+	MipFilter = POINT;
+	AddressU = CLAMP;
+	AddressV = CLAMP;
+};
+
+// The normal final-output permutation publishes its authoritative transfer for
+// the next inserted draw. Custom mid-frame permutations cannot inspect the
+// final swapchain directly and retain the preceding frame-count uniform value.
+texture2D OutputStateTexture {
+	Width = 1;
+	Height = 1;
+	Format = RGBA32F;
+};
+
+sampler2D OutputStateSampler {
+	Texture = OutputStateTexture;
+	MinFilter = POINT;
+	MagFilter = POINT;
+	MipFilter = POINT;
+	AddressU = CLAMP;
+	AddressV = CLAMP;
+};
+
+// Split scene values must not pass through the normalized swapchain between
+// RenoFX and RenoFXOutput. This texture is the authoritative adjacent-pass
+// handoff and preserves extended sRGB and linear values above 1.0.
+texture2D SplitIntermediateTexture {
+	Width = BUFFER_WIDTH;
+	Height = BUFFER_HEIGHT;
+	Format = RGBA16F;
+};
+
+sampler2D SplitIntermediateSampler {
+	Texture = SplitIntermediateTexture;
 	MinFilter = POINT;
 	MagFilter = POINT;
 	MipFilter = POINT;
@@ -524,6 +590,14 @@ float3 PQDecode(float3 pq) {
 	return pow(numerator / denominator, 1.0f / m1);
 }
 
+float3 PQEncodeSafe(float3 normalized_nits) {
+	return sign(normalized_nits) * PQEncode(abs(normalized_nits));
+}
+
+float3 PQDecodeSafe(float3 pq) {
+	return sign(pq) * PQDecode(abs(pq));
+}
+
 uint ResolveInputTransfer() {
 	if (INPUT_TRANSFER != INPUT_AUTO) return INPUT_TRANSFER;
 
@@ -533,9 +607,10 @@ uint ResolveInputTransfer() {
 	if (BUFFER_COLOR_SPACE == COLOR_SPACE_HDR10_PQ) return INPUT_HDR10;
 	// HLG is known but unsupported; treat it as the SDR sRGB fallback.
 	if (BUFFER_COLOR_SPACE == COLOR_SPACE_HDR10_HLG) return INPUT_SRGB;
-#endif
-
-#if defined(BUFFER_COLOR_FORMAT)
+	// Custom insertion targets report unknown color-space metadata. Their
+	// resource format does not identify the transfer used by the game.
+	if (BUFFER_COLOR_SPACE == COLOR_SPACE_UNKNOWN) return INPUT_SRGB;
+#elif defined(BUFFER_COLOR_FORMAT)
 	if (BUFFER_COLOR_FORMAT == FORMAT_RGBA16_FLOAT) return INPUT_SCRGB;
 	if (BUFFER_COLOR_FORMAT == FORMAT_RGB10A2) return INPUT_HDR10;
 #elif defined(BUFFER_COLOR_BIT_DEPTH)
@@ -547,18 +622,27 @@ uint ResolveInputTransfer() {
 	return INPUT_SRGB;
 }
 
-float ResolveInputScalingNits() {
-	uint input_transfer = ResolveInputTransfer();
+float ResolveInputScalingNits(uint input_transfer) {
 	if (input_transfer == INPUT_HDR10 || input_transfer == INPUT_SCRGB) {
 		return max(INPUT_SCALING_NITS, 1.0f);
 	}
 	return 100.0f;
 }
 
+float ResolveInputScalingNits() {
+	return ResolveInputScalingNits(ResolveInputTransfer());
+}
+
 float3 DecodeInput(float3 input_color) {
 	uint input_transfer = ResolveInputTransfer();
 	if (input_transfer == INPUT_SRGB) {
 		return SRGBDecode(input_color);
+	}
+	if (input_transfer == INPUT_GAMMA22) {
+		return SignPow(input_color, 2.2f);
+	}
+	if (input_transfer == INPUT_BT1886) {
+		return SignPow(input_color, 2.4f);
 	}
 	if (input_transfer == INPUT_HDR10) {
 		float3 bt2020_nits = PQDecode(input_color) * 10000.0f;
@@ -570,6 +654,58 @@ float3 DecodeInput(float3 input_color) {
 		return input_color * (80.0f / ResolveInputScalingNits());
 	}
 	return input_color;
+}
+
+float3 DecodeIntermediate(
+		float3 input_color,
+		uint intermediate_transfer,
+		float intermediate_scaling_nits) {
+	if (intermediate_transfer == INPUT_SRGB) {
+		return SRGBDecode(input_color);
+	}
+	if (intermediate_transfer == INPUT_GAMMA22) {
+		return SignPow(input_color, 2.2f);
+	}
+	if (intermediate_transfer == INPUT_BT1886) {
+		return SignPow(input_color, 2.4f);
+	}
+	if (intermediate_transfer == INPUT_HDR10) {
+		// Unlike physical PQ input, the split pass may contain signed BT.2020
+		// components in a floating-point target. Keep them until final gamut
+		// compression rather than clipping them at the intermediate boundary.
+		float3 bt2020_nits = PQDecodeSafe(input_color) * 10000.0f;
+		return mul(BT2020_TO_BT709, bt2020_nits)
+				/ max(intermediate_scaling_nits, 1.0f);
+	}
+	if (intermediate_transfer == INPUT_SCRGB) {
+		return input_color * (80.0f / max(intermediate_scaling_nits, 1.0f));
+	}
+	return input_color;
+}
+
+float3 EncodeIntermediate(
+		float3 bt709,
+		uint intermediate_transfer,
+		float intermediate_scaling_nits) {
+	if (intermediate_transfer == INPUT_SRGB) {
+		return SRGBEncode(bt709);
+	}
+	if (intermediate_transfer == INPUT_GAMMA22) {
+		return SignPow(bt709, 1.0f / 2.2f);
+	}
+	if (intermediate_transfer == INPUT_BT1886) {
+		return SignPow(bt709, 1.0f / 2.4f);
+	}
+	if (intermediate_transfer == INPUT_HDR10) {
+		float3 bt2020_nits = mul(BT709_TO_BT2020, bt709)
+				* max(intermediate_scaling_nits, 1.0f);
+		return PQEncodeSafe(bt2020_nits / 10000.0f);
+	}
+	if (intermediate_transfer == INPUT_SCRGB) {
+		// scRGB 1.0 represents 80 nits.
+		return bt709 * (max(intermediate_scaling_nits, 1.0f) / 80.0f);
+	}
+	return bt709;
 }
 
 uint ResolveOutputTransfer() {
@@ -596,6 +732,63 @@ uint ResolveOutputTransfer() {
 #endif
 
 	return OUTPUT_SRGB;
+}
+
+bool IsSDROutputTransfer(uint output_transfer) {
+	return output_transfer == OUTPUT_LINEAR
+			|| output_transfer == OUTPUT_SRGB
+			|| output_transfer == OUTPUT_GAMMA22
+			|| output_transfer == OUTPUT_BT1886;
+}
+
+bool UsesSDREotfEmulation(uint output_transfer) {
+	uint input_transfer = ResolveInputTransfer();
+	return !IsSDROutputTransfer(output_transfer)
+			&& input_transfer != INPUT_GAMMA22
+			&& input_transfer != INPUT_BT1886
+			&& GAMMA_CORRECTION != GAMMA_CORRECTION_OFF;
+}
+
+uint ResolveSceneOutputTransfer() {
+	if (OUTPUT_TRANSFER != OUTPUT_AUTO) return ResolveOutputTransfer();
+
+#if defined(BUFFER_COLOR_SPACE)
+	// A normal ReShade permutation has authoritative final-target metadata.
+	if (BUFFER_COLOR_SPACE != COLOR_SPACE_UNKNOWN) return ResolveOutputTransfer();
+#endif
+
+	// An inserted permutation cannot observe the final swapchain directly. The
+	// final technique publishes the authoritative transfer for the next frame.
+	if (SEPARATE_SCENE_UI_SCALING) {
+		float4 output_state = tex2Dlod(
+				OutputStateSampler,
+				float4(0.5f, 0.5f, 0.0f, 0.0f));
+		uint output_state_frame = uint(output_state.g + 0.5f)
+				| (uint(output_state.b + 0.5f) << 16u);
+		if (output_state.a >= 0.5f && output_state_frame == FRAME_COUNT) {
+			return uint(output_state.r + 0.5f);
+		}
+		return OUTPUT_HDR10;
+	}
+	return ResolveOutputTransfer();
+}
+
+bool HasPresentationTargetMetadata() {
+#if defined(BUFFER_COLOR_SPACE)
+	return BUFFER_COLOR_SPACE != COLOR_SPACE_UNKNOWN;
+#else
+	return false;
+#endif
+}
+
+bool IsFloatRenderTarget() {
+#if defined(BUFFER_COLOR_FORMAT)
+	return BUFFER_COLOR_FORMAT == FORMAT_RGBA16_FLOAT;
+#elif defined(BUFFER_COLOR_BIT_DEPTH)
+	return BUFFER_COLOR_BIT_DEPTH == 16;
+#else
+	return false;
+#endif
 }
 
 float3 ToWorking(float3 bt709, uint working_space) {
@@ -1171,15 +1364,15 @@ float WhiteClipFromGradingPeak(float3 peak_white) {
 float3 ApplyNeutwo(float3 bt709, float white_clip) {
 	if (TONEMAP_ENABLED == 0) return bt709;
 
-	uint output_transfer = ResolveOutputTransfer();
+	uint output_transfer = ResolveSceneOutputTransfer();
 	float output_peak = 1.0f;
-	if (output_transfer != OUTPUT_SRGB) {
+	if (!IsSDROutputTransfer(output_transfer)) {
 		float game_nits = max(GAME_BRIGHTNESS_NITS, 1.0f);
 		output_peak = max(TONEMAP_PEAK_NITS / game_nits, 1.0f);
 	}
 	float peak = output_peak;
 	float3 peak3 = float3(peak, peak, peak);
-	if (output_transfer != OUTPUT_SRGB && GAMMA_CORRECTION != GAMMA_CORRECTION_OFF) {
+	if (UsesSDREotfEmulation(output_transfer)) {
 		if (GAMMA_CORRECTION == GAMMA_CORRECTION_24) {
 			peak = SRGBDecode(SignPow(output_peak, 1.0f / 2.4f));
 		} else {
@@ -1376,13 +1569,12 @@ float3 GamutCompressWeightedLMS(
 	return MBToWeightedLMS(white + direction * final_scale, mb.z);
 }
 
-float3 ApplyGamutCompression(float3 bt709) {
+float3 ApplyGamutCompression(float3 bt709, uint output_transfer) {
 	if (GAMUT_COMPRESSION_TARGET == GAMUT_TARGET_OFF) return bt709;
 
-	uint output_transfer = ResolveOutputTransfer();
 	bool target_bt2020 = GAMUT_COMPRESSION_TARGET == GAMUT_TARGET_BT2020
 			|| (GAMUT_COMPRESSION_TARGET == GAMUT_TARGET_AUTO
-					&& output_transfer != OUTPUT_SRGB);
+					&& !IsSDROutputTransfer(output_transfer));
 
 	// Nonnegative target RGB components prove that the chromaticity is already
 	// inside the target triangle. Brightness is intentionally unbounded here.
@@ -1413,6 +1605,10 @@ float3 ApplyGamutCompression(float3 bt709) {
 			* max(adaptive_state_lms, 1e-6f)
 			/ LMS_WEIGHTS;
 	return mul(LMS_TO_BT709, final_lms);
+}
+
+float3 ApplyGamutCompression(float3 bt709) {
+	return ApplyGamutCompression(bt709, ResolveOutputTransfer());
 }
 
 float3 ApplyGammaCorrectionBT709(float3 bt709, float gamma) {
@@ -1464,6 +1660,41 @@ float3 ApplyGammaCorrection(float3 bt709) {
 		return ApplyGammaCorrectionYf(bt709, gamma);
 	}
 	return ApplyGammaCorrectionBT709(bt709, gamma);
+}
+
+float3 RemoveGammaCorrection(float3 bt709) {
+	float inverse_gamma = GAMMA_CORRECTION == GAMMA_CORRECTION_24
+			? 1.0f / 2.4f
+			: 1.0f / 2.2f;
+	uint working_space = GAMMA_CORRECTION_WORKING_SPACE;
+	if (working_space == SPACE_BT2020) {
+		float3 bt2020 = mul(BT709_TO_BT2020, bt709);
+		bt2020 = SRGBDecode(SignPow(bt2020, inverse_gamma));
+		return mul(BT2020_TO_BT709, bt2020);
+	}
+	if (working_space == SPACE_AP1) {
+		float3 ap1 = mul(BT709_TO_AP1, bt709);
+		ap1 = SRGBDecode(SignPow(ap1, inverse_gamma));
+		return mul(AP1_TO_BT709, ap1);
+	}
+	if (working_space == SPACE_LMS) {
+		float3 white = WorkingWhite(SPACE_LMS);
+		float3 normalized = DivideSafe(
+				mul(BT709_TO_LMS, bt709),
+				white,
+				0.0f);
+		normalized = SRGBDecode(SignPow(normalized, inverse_gamma));
+		return mul(LMS_TO_BT709, normalized * white);
+	}
+	if (working_space == SPACE_YF) {
+		float white_yf = max(YfWhite(), 1e-6f);
+		float source_yf = max(YfFromBT709(bt709), 0.0f);
+		float normalized_yf = source_yf / white_yf;
+		float mapped_yf = SRGBDecode(SignPow(normalized_yf, inverse_gamma))
+				* white_yf;
+		return ScaleToYf(bt709, source_yf, mapped_yf);
+	}
+	return SRGBDecode(SignPow(bt709, inverse_gamma));
 }
 
 float2 DaylightChromaticityFromKelvin(float kelvin) {
@@ -1519,7 +1750,7 @@ float EstimatePeakNits() {
 	// Evaluate the configured maximum input white at full HDR Boost availability
 	// so the estimate remains independent of scene-dependent APL limiting.
 	float3 probe = EstimatePeakWhiteBT709(1.0f);
-	float reference_white_nits = ResolveOutputTransfer() == OUTPUT_SRGB
+	float reference_white_nits = IsSDROutputTransfer(ResolveSceneOutputTransfer())
 			? 100.0f
 			: GAME_BRIGHTNESS_NITS;
 	return max(probe.r, max(probe.g, probe.b)) * reference_white_nits;
@@ -1528,40 +1759,66 @@ float EstimatePeakNits() {
 float3 PrepareOutputLinear(
 		float3 bt709,
 		float white_clip,
-		float3 color_temperature_adaptation) {
-	uint output_transfer = ResolveOutputTransfer();
+		float3 color_temperature_adaptation,
+		bool apply_gamma_correction) {
+	uint output_transfer = ResolveSceneOutputTransfer();
 	bt709 = ApplyNeutwo(bt709, white_clip);
 
-	if (output_transfer != OUTPUT_SRGB && GAMMA_CORRECTION != GAMMA_CORRECTION_OFF) {
+	if (apply_gamma_correction && UsesSDREotfEmulation(output_transfer)) {
 		bt709 = ApplyGammaCorrection(bt709);
 	}
 	bt709 = ApplyColorTemperature(bt709, color_temperature_adaptation);
 
-	return ApplyGamutCompression(bt709);
+	return bt709;
+}
+
+float3 EncodePresentation(
+		float3 bt709,
+		float reference_white_nits,
+		uint output_transfer) {
+	bt709 = ApplyGamutCompression(bt709, output_transfer);
+
+	if (output_transfer == OUTPUT_LINEAR) {
+		return bt709;
+	}
+	if (output_transfer == OUTPUT_SRGB) {
+		return SRGBEncode(bt709);
+	}
+	if (output_transfer == OUTPUT_GAMMA22) {
+		return SignPow(bt709, 1.0f / 2.2f);
+	}
+	if (output_transfer == OUTPUT_BT1886) {
+		return SignPow(bt709, 1.0f / 2.4f);
+	}
+
+	float scaling_nits = max(reference_white_nits, 1.0f);
+	if (output_transfer == OUTPUT_HDR10) {
+		float3 bt2020_nits = mul(BT709_TO_BT2020, bt709)
+				* scaling_nits;
+		return PQEncode(bt2020_nits / 10000.0f);
+	}
+
+	// scRGB is linear BT.709 where 1.0 represents 80 nits.
+	return bt709 * (scaling_nits / 80.0f);
+}
+
+float3 EncodePresentation(float3 bt709, float reference_white_nits) {
+	return EncodePresentation(
+			bt709,
+			reference_white_nits,
+			ResolveOutputTransfer());
 }
 
 float3 EncodeOutput(
 		float3 bt709,
 		float white_clip,
 		float3 color_temperature_adaptation) {
-	uint output_transfer = ResolveOutputTransfer();
 	bt709 = PrepareOutputLinear(
 			bt709,
 			white_clip,
-			color_temperature_adaptation);
-
-	if (output_transfer == OUTPUT_SRGB) {
-		return SRGBEncode(bt709);
-	}
-
-	if (output_transfer == OUTPUT_HDR10) {
-		float3 bt2020_nits = mul(BT709_TO_BT2020, bt709)
-				* GAME_BRIGHTNESS_NITS;
-		return PQEncode(bt2020_nits / 10000.0f);
-	}
-
-	// scRGB is linear BT.709 where 1.0 represents 80 nits.
-	return bt709 * (GAME_BRIGHTNESS_NITS / 80.0f);
+			color_temperature_adaptation,
+			true);
+	return EncodePresentation(bt709, GAME_BRIGHTNESS_NITS);
 }
 
 float4 MeasureAPL(
@@ -1595,6 +1852,23 @@ float ComputeAPLHDRBoostAvailability() {
 float4 CacheFrameState(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
+	if (position.x >= 3.0f) {
+		return float4(
+				float(FRAME_COUNT & 0xffffu),
+				float(FRAME_COUNT >> 16u),
+				float(BUFFER_WIDTH),
+				float(BUFFER_HEIGHT));
+	}
+
+	if (position.x >= 2.0f) {
+		uint intermediate_transfer = ResolveInputTransfer();
+		return float4(
+				float(intermediate_transfer),
+				ResolveInputScalingNits(intermediate_transfer),
+				IsFloatRenderTarget() ? 1.0f : 0.0f,
+				HasPresentationTargetMetadata() ? 1.0f : 0.0f);
+	}
+
 	if (position.x >= 1.0f) {
 		float estimated_peak_nits = 0.0f;
 		if (SHOW_PEAK_BRIGHTNESS != 0) {
@@ -1612,16 +1886,38 @@ float4 CacheFrameState(
 	return float4(estimated_peak_white_working, boost_availability);
 }
 
-float3 EncodeOverlayNits(float nits) {
+float4 CacheOutputState(
+		float4 position : SV_Position,
+		float2 texcoord : TexCoord) : SV_Target {
+	return float4(
+			float(ResolveOutputTransfer()),
+			float(FRAME_COUNT & 0xffffu),
+			float(FRAME_COUNT >> 16u),
+			1.0f);
+}
+
+float3 EncodeOverlayNits(float nits, uint output_transfer) {
 	float safe_nits = max(nits, 0.0f);
-	uint output_transfer = ResolveOutputTransfer();
 	if (output_transfer == OUTPUT_HDR10) {
 		return PQEncode((safe_nits / 10000.0f).xxx);
 	}
 	if (output_transfer == OUTPUT_SCRGB) {
 		return (safe_nits / 80.0f).xxx;
 	}
+	if (output_transfer == OUTPUT_LINEAR) {
+		return saturate(safe_nits / 100.0f).xxx;
+	}
+	if (output_transfer == OUTPUT_GAMMA22) {
+		return pow(saturate(safe_nits / 100.0f), 1.0f / 2.2f).xxx;
+	}
+	if (output_transfer == OUTPUT_BT1886) {
+		return pow(saturate(safe_nits / 100.0f), 1.0f / 2.4f).xxx;
+	}
 	return SRGBEncode(saturate(safe_nits / 100.0f).xxx);
+}
+
+float3 EncodeOverlayNits(float nits) {
+	return EncodeOverlayNits(nits, ResolveOutputTransfer());
 }
 
 // Compact inline 5x7 font containing only the characters needed by the peak
@@ -1706,7 +2002,10 @@ float PeakTextCoverage(float2 pixel_position, float2 origin, float scale, float 
 	return pixel_bit - floor(pixel_bit * 0.5f) * 2.0f;
 }
 
-float4 DrawPeakBrightness(float4 output, float2 pixel_position) {
+float4 DrawPeakBrightness(
+		float4 output,
+		float2 pixel_position,
+		uint output_transfer) {
 	if (SHOW_PEAK_BRIGHTNESS == 0) return output;
 
 	float scale = max(2.0f, floor(BUFFER_HEIGHT / 540.0f));
@@ -1718,18 +2017,37 @@ float4 DrawPeakBrightness(float4 output, float2 pixel_position) {
 
 	float peak_nits = tex2Dlod(
 			FrameStateSampler,
-			float4(0.75f, 0.5f, 0.0f, 0.0f)).r;
+			float4(3.0f / 8.0f, 0.5f, 0.0f, 0.0f)).r;
 	float2 text_origin = panel_min + float2(7.0f, 5.0f) * scale;
 
-	float text_nits = ResolveOutputTransfer() == OUTPUT_SRGB
+	float text_nits = IsSDROutputTransfer(output_transfer)
 			? 100.0f
-			: max(100.0f, min(GAME_BRIGHTNESS_NITS, 203.0f));
+			: max(
+					100.0f,
+					min(
+							SEPARATE_SCENE_UI_SCALING
+									? UI_BRIGHTNESS_NITS
+									: GAME_BRIGHTNESS_NITS,
+							203.0f));
 
-	output.rgb = lerp(output.rgb, EncodeOverlayNits(0.0f), 0.72f);
+	output.rgb = lerp(
+			output.rgb,
+			EncodeOverlayNits(0.0f, output_transfer),
+			0.72f);
 
 	float text_coverage = PeakTextCoverage(pixel_position, text_origin, scale, peak_nits);
-	output.rgb = lerp(output.rgb, EncodeOverlayNits(text_nits), text_coverage);
+	output.rgb = lerp(
+			output.rgb,
+			EncodeOverlayNits(text_nits, output_transfer),
+			text_coverage);
 	return output;
+}
+
+float4 DrawPeakBrightness(float4 output, float2 pixel_position) {
+	return DrawPeakBrightness(
+			output,
+			pixel_position,
+			ResolveOutputTransfer());
 }
 
 float4 Main(float4 position : SV_Position, float2 texcoord : TexCoord) : SV_Target {
@@ -1737,15 +2055,41 @@ float4 Main(float4 position : SV_Position, float2 texcoord : TexCoord) : SV_Targ
 	float3 bt709 = DecodeInput(input.rgb);
 	float4 frame_state = tex2Dlod(
 			FrameStateSampler,
-			float4(0.25f, 0.5f, 0.0f, 0.0f));
+			float4(1.0f / 8.0f, 0.5f, 0.0f, 0.0f));
 	float white_clip = WhiteClipFromGradingPeak(frame_state.rgb);
 	float3 color_temperature_adaptation = 1.0f.xxx;
 	if (abs(COLOR_TEMPERATURE_KELVIN - 6500.0f) >= 0.5f) {
 		color_temperature_adaptation = tex2Dlod(
 				FrameStateSampler,
-				float4(0.75f, 0.5f, 0.0f, 0.0f)).gba;
+				float4(3.0f / 8.0f, 0.5f, 0.0f, 0.0f)).gba;
 	}
 	bt709 = ApplyControls(bt709, frame_state.a, frame_state.rgb);
+	if (SEPARATE_SCENE_UI_SCALING) {
+		bt709 = PrepareOutputLinear(
+				bt709,
+				white_clip,
+				color_temperature_adaptation,
+				false);
+		uint intermediate_transfer = ResolveInputTransfer();
+		float intermediate_scaling_nits = ResolveInputScalingNits(
+				intermediate_transfer);
+		if (!IsSDROutputTransfer(ResolveSceneOutputTransfer())) {
+			float scene_to_ui_scale = max(GAME_BRIGHTNESS_NITS, 1.0f)
+					/ max(UI_BRIGHTNESS_NITS, 1.0f);
+			if (UsesSDREotfEmulation(ResolveSceneOutputTransfer())) {
+				bt709 = RemoveGammaCorrection(
+						ApplyGammaCorrection(bt709) * scene_to_ui_scale);
+			} else {
+				bt709 *= scene_to_ui_scale;
+			}
+		}
+		return float4(
+				EncodeIntermediate(
+						bt709,
+						intermediate_transfer,
+						intermediate_scaling_nits),
+				input.a);
+	}
 
 	float4 output = float4(
 			EncodeOutput(
@@ -1756,9 +2100,74 @@ float4 Main(float4 position : SV_Position, float2 texcoord : TexCoord) : SV_Targ
 	return DrawPeakBrightness(output, position.xy);
 }
 
+float4 PublishProcessedScene(
+		float4 position : SV_Position,
+		float2 texcoord : TexCoord) : SV_Target {
+	float4 processed = tex2D(SplitIntermediateSampler, texcoord);
+	if (!SEPARATE_SCENE_UI_SCALING) return processed;
+	if (IsFloatRenderTarget()) return Main(position, texcoord);
+
+	// A normalized swapchain cannot carry extended sRGB between the adjacent
+	// split techniques. Leave it unchanged; RenoFXOutput reads the RGBA16F
+	// handoff directly instead.
+	return tex2D(ReShade::BackBuffer, texcoord);
+}
+
+float4 PresentOutput(
+		float4 position : SV_Position,
+		float2 texcoord : TexCoord) : SV_Target {
+	float4 back_buffer = tex2D(ReShade::BackBuffer, texcoord);
+	if (!SEPARATE_SCENE_UI_SCALING) return back_buffer;
+	float4 intermediate_metadata = tex2Dlod(
+			FrameStateSampler,
+			float4(5.0f / 8.0f, 0.5f, 0.0f, 0.0f));
+	float4 handoff_metadata = tex2Dlod(
+			FrameStateSampler,
+			float4(7.0f / 8.0f, 0.5f, 0.0f, 0.0f));
+	uint handoff_frame = uint(handoff_metadata.r + 0.5f)
+			| (uint(handoff_metadata.g + 0.5f) << 16u);
+	uint previous_frame = FRAME_COUNT == 0u
+			? 0xfffffffeu
+			: FRAME_COUNT - 1u;
+	bool current_or_inserted_frame = handoff_frame == FRAME_COUNT
+			|| handoff_frame == previous_frame;
+	bool valid_handoff = current_or_inserted_frame
+			&& handoff_metadata.b == float(BUFFER_WIDTH)
+			&& handoff_metadata.a == float(BUFFER_HEIGHT);
+	if (!valid_handoff) return back_buffer;
+
+	bool float_target = intermediate_metadata.b >= 0.5f;
+	bool presentation_target = intermediate_metadata.a >= 0.5f;
+	// A normalized inserted RTV cannot carry the processed scene and no longer
+	// contains a complete downstream/UI composite in the RGBA16F handoff.
+	if (!float_target && !presentation_target) return back_buffer;
+
+	float4 input = float_target
+			? back_buffer
+			: tex2D(SplitIntermediateSampler, texcoord);
+	uint intermediate_transfer = uint(intermediate_metadata.r + 0.5f);
+	float intermediate_scaling_nits = intermediate_metadata.g;
+	uint output_transfer = ResolveOutputTransfer();
+	float3 bt709 = DecodeIntermediate(
+			input.rgb,
+			intermediate_transfer,
+			intermediate_scaling_nits);
+	if (UsesSDREotfEmulation(output_transfer)) {
+		bt709 = ApplyGammaCorrection(bt709);
+	}
+
+	float4 output = float4(
+			EncodePresentation(
+					bt709,
+					UI_BRIGHTNESS_NITS,
+					output_transfer),
+			input.a);
+	return DrawPeakBrightness(output, position.xy, output_transfer);
+}
+
 technique RenoFX <
 	ui_label = "RenoFX HDR Toolkit";
-	ui_tooltip = "Processes SDR or native HDR input with HDR expansion, color grading, tone mapping, gamut handling, and SDR or HDR output presentation.";
+	ui_tooltip = "Processes SDR or native HDR input with HDR expansion, color grading, tone mapping, and presentation. In split mode, select this technique in RenoDX Pipeline Insert and leave it disabled in ReShade's normal technique list.";
 > {
 	pass MeasureAveragePictureLevel {
 		VertexShader = PostProcessVS;
@@ -1777,6 +2186,31 @@ technique RenoFX <
 	pass Composite {
 		VertexShader = PostProcessVS;
 		PixelShader = Main;
+		RenderTarget = SplitIntermediateTexture;
+		GenerateMipmaps = false;
+	}
+
+	pass Publish {
+		VertexShader = PostProcessVS;
+		PixelShader = PublishProcessedScene;
+		GenerateMipmaps = false;
+	}
+}
+
+technique RenoFXOutput <
+	ui_label = "RenoFX HDR Toolkit - Final Output";
+	ui_tooltip = "Final output scaling and encoding for Separate Scene/UI Scaling. Enable this after all UI and other ReShade techniques, and keep it disabled when split mode is off.";
+> {
+	pass CachePresentationState {
+		VertexShader = PostProcessVS;
+		PixelShader = CacheOutputState;
+		RenderTarget = OutputStateTexture;
+		GenerateMipmaps = false;
+	}
+
+	pass Present {
+		VertexShader = PostProcessVS;
+		PixelShader = PresentOutput;
 		GenerateMipmaps = false;
 	}
 }
