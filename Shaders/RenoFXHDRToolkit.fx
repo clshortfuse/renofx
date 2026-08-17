@@ -10,6 +10,7 @@
 #define SPACE_LMS    3
 #define SPACE_YF     4
 #define SPACE_MAX_CHANNEL 5
+#define SPACE_SRGB   6
 
 #define INPUT_AUTO   0
 #define INPUT_LINEAR 1
@@ -47,6 +48,10 @@
 
 #define SATURATION_OKLAB      0
 #define SATURATION_WORKING_YF 1
+
+#define PIPELINE_DEBUG_OFF                0
+#define PIPELINE_DEBUG_SWAPCHAIN          1
+#define PIPELINE_DEBUG_SPLIT_INTERMEDIATE 2
 
 // Average picture level where inverse tone mapping reduction begins, expressed
 // as a percentage of normalized SDR white. Override before compiling to experiment.
@@ -260,6 +265,14 @@ uniform float UI_BRIGHTNESS_NITS <
 	ui_tooltip = "Sets graphics/UI reference white for HDR10 and scRGB output when Separate Scene/UI Scaling is enabled. This setting does not affect sRGB output.";
 > = 100.0;
 
+uniform uint PIPELINE_DEBUG_VIEW <
+	ui_type = "combo";
+	ui_category = "RenoDX Pipeline Insert";
+	ui_items = "Off\0Swapchain Image\0Split Intermediate\0";
+	ui_label = "Debug View";
+	ui_tooltip = "Displays the final game swapchain image or RenoFX's decoded RGBA16F scene handoff before UI compositing.";
+> = PIPELINE_DEBUG_OFF;
+
 uniform float HDR_BOOST <
 	ui_type = "slider";
 	ui_category = "Inverse Tone Mapping";
@@ -295,7 +308,7 @@ uniform uint HDR_BOOST_APL_LIMITER <
 	ui_category = "Inverse Tone Mapping";
 	ui_items = "Off\0On\0";
 	ui_label = "APL Limiter";
-	ui_tooltip = "Lowers inverse tone mapping based on the average luminance of the full scene. This prevents very bright scenes from becoming too bright.";
+	ui_tooltip = "Lowers inverse tone mapping based on the average luminance of the full scene. This prevents very bright scenes from becoming too bright. It is bypassed while HAnS Highlight Analysis is active for SDR input.";
 > = 1;
 
 uniform float HIGHLIGHTS <
@@ -466,8 +479,11 @@ sampler2D APLSampler {
 // availability in alpha. Texel 1 stores the APL-independent overlay peak nits
 // in red and the Bradford color-temperature adaptation in GBA. Texel 2 stores
 // the inserted permutation's resolved game/intermediate transfer and scaling
-// in RG. Blue indicates that the processed scene was copied into an RGBA16F
-// target, while alpha indicates authoritative presentation-target metadata.
+// in RG. Blue indicates that the inserted target is RGBA16F, while alpha
+// indicates authoritative presentation-target metadata. When both are zero,
+// the normalized inserted target is treated as a final-output input: RenoFX
+// clears it after preserving the scene in `SplitIntermediateTexture`, so later
+// game UI can be composited with that HDR scene at presentation.
 // Texel 3 provides a current-frame and matching-dimensions handshake so the
 // final pass never consumes stale state or a differently sized handoff.
 texture2D FrameStateTexture {
@@ -765,7 +781,15 @@ uint ResolveSceneOutputTransfer() {
 				float4(0.5f, 0.5f, 0.0f, 0.0f));
 		uint output_state_frame = uint(output_state.g + 0.5f)
 				| (uint(output_state.b + 0.5f) << 16u);
-		if (output_state.a >= 0.5f && output_state_frame == FRAME_COUNT) {
+		uint previous_frame = FRAME_COUNT == 0u
+				? 0xfffffffeu
+				: FRAME_COUNT - 1u;
+		// The final technique publishes this at the previous present boundary.
+		// The inserted technique consumes it before the current present updates
+		// ReShade's frame counter.
+		if (output_state.a >= 0.5f
+				&& (output_state_frame == FRAME_COUNT
+						|| output_state_frame == previous_frame)) {
 			return uint(output_state.r + 0.5f);
 		}
 		return OUTPUT_HDR10;
@@ -810,6 +834,10 @@ float3 WorkingWhite(uint working_space) {
 }
 
 float WorkingLuminance(float3 working, uint working_space) {
+	if (working_space == SPACE_SRGB) {
+		// Paper-compatible luma for an encoded sRGB signal.
+		return dot(working, float3(0.2989f, 0.5870f, 0.1140f));
+	}
 	if (working_space == SPACE_BT2020) {
 		return dot(working, float3(0.2627002120f, 0.6779980715f, 0.0593017165f));
 	}
@@ -821,6 +849,12 @@ float WorkingLuminance(float3 working, uint working_space) {
 	}
 	return dot(working, float3(0.2126390059f, 0.7151686788f, 0.0721923154f));
 }
+
+// HAnS is included after input decoding and the working-space helpers it
+// consumes. Its analysis passes are scheduled explicitly below.
+#define RENOFX_HANS_IMPLEMENTATION 1
+#include "RenoFXHAnS.fx"
+#undef RENOFX_HANS_IMPLEMENTATION
 
 float3 HueRestoreWeightedLMSToMB(float3 weighted_lms) {
 	float y = max(weighted_lms.x + weighted_lms.y, 0.0f);
@@ -1225,14 +1259,19 @@ float3 ApplyHDRBoostGamutExpansion(
 		float3 source_bt709,
 		float3 boosted_bt709) {
 	float amount = saturate(HDR_BOOST_GAMUT_EXPANSION * 0.01f);
-	if (amount >= 1.0f) return boosted_bt709;
 
 	float source_yf = YfFromBT709(source_bt709);
 	float boosted_yf = YfFromBT709(boosted_bt709);
-	if (source_yf <= 1e-6f || boosted_yf <= 1e-6f) return boosted_bt709;
+	if (source_yf <= 1e-6f
+			|| boosted_yf <= 1e-6f) {
+		return boosted_bt709;
+	}
 
+	// Compare the HDR Boost result to a source-color version at exactly the
+	// same brightness. Expansion therefore follows HDR Boost's local strength.
 	float3 brightness_only = source_bt709 * (boosted_yf / source_yf);
-	return lerp(brightness_only, boosted_bt709, amount);
+	float3 gamut_at_brightness = boosted_bt709;
+	return lerp(brightness_only, gamut_at_brightness, amount);
 }
 
 float3 ApplyBrightnessGradingYf(float3 bt709) {
@@ -1295,7 +1334,8 @@ float3 ApplyControls(
 	// hue once, then apply intentional saturation and blowout adjustments.
 	if (HDR_BOOST_GAMUT_EXPANSION >= 100.0f
 			&& HDR_BOOST_SPACE == GRADING_SPACE
-			&& GRADING_SPACE != SPACE_YF) {
+			&& GRADING_SPACE != SPACE_YF
+			&& !HAnSShouldAnalyze()) {
 		float3 working = ToWorking(bt709, GRADING_SPACE);
 		working = ApplyCombinedBrightnessShaping(
 				working,
@@ -1316,7 +1356,10 @@ float3 ApplyControls(
 		working = ApplyHDRBoost(working, HDR_BOOST_SPACE, boost_availability);
 		controlled = FromWorking(working, HDR_BOOST_SPACE);
 	}
-	controlled = ApplyHDRBoostGamutExpansion(bt709, controlled);
+
+	controlled = ApplyHDRBoostGamutExpansion(
+			bt709,
+			controlled);
 
 	if (GRADING_SPACE == SPACE_YF) {
 		controlled = ApplyGradingYf(controlled);
@@ -1824,7 +1867,9 @@ float3 EncodeOutput(
 float4 MeasureAPL(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
-	if (HDR_BOOST_APL_LIMITER == 0 || HDR_BOOST <= 0.0f) {
+	// HAnS owns HDR Boost availability for supported SDR input. The global APL
+	// limiter remains available whenever HAnS is disabled or bypassed for HDR.
+	if (HDR_BOOST_APL_LIMITER == 0 || HDR_BOOST <= 0.0f || HAnSShouldAnalyze()) {
 		return 0.0f.xxxx;
 	}
 
@@ -1835,7 +1880,9 @@ float4 MeasureAPL(
 }
 
 float ComputeAPLHDRBoostAvailability() {
-	if (HDR_BOOST_APL_LIMITER == 0 || HDR_BOOST <= 0.0f) return 1.0f;
+	if (HDR_BOOST_APL_LIMITER == 0
+			|| HDR_BOOST <= 0.0f
+			|| HAnSShouldAnalyze()) return 1.0f;
 
 	float apl = tex2Dlod(
 			APLSampler,
@@ -1878,12 +1925,12 @@ float4 CacheFrameState(
 		return float4(estimated_peak_nits, color_temperature_adaptation);
 	}
 
-	float boost_availability = ComputeAPLHDRBoostAvailability();
-	float3 estimated_peak_white = EstimatePeakWhiteBT709(boost_availability);
+	float apl_boost_availability = ComputeAPLHDRBoostAvailability();
+	float3 estimated_peak_white = EstimatePeakWhiteBT709(apl_boost_availability);
 	float3 estimated_peak_white_working = GRADING_SPACE == SPACE_YF
 			? estimated_peak_white
 			: ToWorking(estimated_peak_white, GRADING_SPACE);
-	return float4(estimated_peak_white_working, boost_availability);
+	return float4(estimated_peak_white_working, apl_boost_availability);
 }
 
 float4 CacheOutputState(
@@ -2063,7 +2110,18 @@ float4 Main(float4 position : SV_Position, float2 texcoord : TexCoord) : SV_Targ
 				FrameStateSampler,
 				float4(3.0f / 8.0f, 0.5f, 0.0f, 0.0f)).gba;
 	}
-	bt709 = ApplyControls(bt709, frame_state.a, frame_state.rgb);
+	float boost_availability = frame_state.a * HAnSLocalAvailability(texcoord);
+	bt709 = ApplyControls(
+			bt709,
+			boost_availability,
+			frame_state.rgb);
+	if (HANS_DEBUG_VIEW != 0) {
+		// HAnS debug values are normalized display-referred signals. Decode them
+		// into the pipeline representation before the ordinary output path.
+		bt709 = SRGBDecode(saturate(HAnSDebugColor(
+				texcoord,
+				boost_availability)));
+	}
 	if (SEPARATE_SCENE_UI_SCALING) {
 		bt709 = PrepareOutputLinear(
 				bt709,
@@ -2105,11 +2163,16 @@ float4 PublishProcessedScene(
 		float2 texcoord : TexCoord) : SV_Target {
 	float4 processed = tex2D(SplitIntermediateSampler, texcoord);
 	if (!SEPARATE_SCENE_UI_SCALING) return processed;
-	if (IsFloatRenderTarget()) return Main(position, texcoord);
+	if (IsFloatRenderTarget()) return processed;
+	if (!HasPresentationTargetMetadata()) {
+		// The normalized target feeds a game true-output shader. Preserve the
+		// scene only in the RGBA16F handoff, then give subsequent UI rendering a
+		// transparent-black canvas whose alpha can become the UI coverage mask.
+		return 0.0f.xxxx;
+	}
 
-	// A normalized swapchain cannot carry extended sRGB between the adjacent
-	// split techniques. Leave it unchanged; RenoFXOutput reads the RGBA16F
-	// handoff directly instead.
+	// A normalized swapchain is not a supported split handoff. Leave it
+	// unchanged rather than applying final-target compositing semantics.
 	return tex2D(ReShade::BackBuffer, texcoord);
 }
 
@@ -2117,6 +2180,7 @@ float4 PresentOutput(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
 	float4 back_buffer = tex2D(ReShade::BackBuffer, texcoord);
+	if (PIPELINE_DEBUG_VIEW == PIPELINE_DEBUG_SWAPCHAIN) return back_buffer;
 	if (!SEPARATE_SCENE_UI_SCALING) return back_buffer;
 	float4 intermediate_metadata = tex2Dlod(
 			FrameStateSampler,
@@ -2138,9 +2202,8 @@ float4 PresentOutput(
 
 	bool float_target = intermediate_metadata.b >= 0.5f;
 	bool presentation_target = intermediate_metadata.a >= 0.5f;
-	// A normalized inserted RTV cannot carry the processed scene and no longer
-	// contains a complete downstream/UI composite in the RGBA16F handoff.
-	if (!float_target && !presentation_target) return back_buffer;
+	bool final_shader_target = !float_target && !presentation_target;
+	if (!float_target && !final_shader_target) return back_buffer;
 
 	float4 input = float_target
 			? back_buffer
@@ -2162,6 +2225,30 @@ float4 PresentOutput(
 					UI_BRIGHTNESS_NITS,
 					output_transfer),
 			input.a);
+	if (PIPELINE_DEBUG_VIEW == PIPELINE_DEBUG_SPLIT_INTERMEDIATE) {
+		return float4(output.rgb, 1.0f);
+	}
+	if (final_shader_target) {
+		// The target was cleared to transparent black by `PublishProcessedScene`.
+		// The game then renders UI into it and its true output shader presents the
+		// resulting UI buffer. It retains the insertion target's intermediate
+		// transfer, so decode and re-encode it at the configured UI brightness
+		// before blending both signals in the final presentation encoding.
+		float ui_alpha = saturate(back_buffer.a);
+		float3 ui_bt709 = DecodeIntermediate(
+				back_buffer.rgb,
+				intermediate_transfer,
+				intermediate_scaling_nits);
+		if (UsesSDREotfEmulation(output_transfer)) {
+			ui_bt709 = ApplyGammaCorrection(ui_bt709);
+		}
+		float3 ui_encoded = EncodePresentation(
+				ui_bt709,
+				UI_BRIGHTNESS_NITS,
+				output_transfer);
+		output.rgb = ui_encoded + output.rgb * (1.0f - ui_alpha);
+		output.a = 1.0f;
+	}
 	return DrawPeakBrightness(output, position.xy, output_transfer);
 }
 
@@ -2169,6 +2256,76 @@ technique RenoFX <
 	ui_label = "RenoFX HDR Toolkit";
 	ui_tooltip = "Processes SDR or native HDR input with HDR expansion, color grading, tone mapping, and presentation. In split mode, select this technique in RenoDX Pipeline Insert and leave it disabled in ReShade's normal technique list.";
 > {
+	pass HAnSExtract {
+		VertexShader = PostProcessVS;
+		PixelShader = HAnSExtractFeatures;
+		RenderTarget = HAnSFeatureTexture;
+		GenerateMipmaps = false;
+	}
+
+	pass HAnSBlurHorizontal {
+#if HANS_USE_COMPUTE
+		ComputeShader = HAnSBoxBlurHorizontalCS;
+		DispatchSizeX = (HANS_ANALYSIS_WIDTH + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeY = (HANS_ANALYSIS_HEIGHT + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeZ = 1;
+#else
+		VertexShader = PostProcessVS;
+		PixelShader = HAnSBoxBlurHorizontal;
+		RenderTarget = HAnSBlurHorizontalTexture;
+#endif
+		GenerateMipmaps = false;
+	}
+
+	pass HAnSBlurVertical {
+#if HANS_USE_COMPUTE
+		ComputeShader = HAnSBoxBlurVerticalCS;
+		DispatchSizeX = (HANS_ANALYSIS_WIDTH + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeY = (HANS_ANALYSIS_HEIGHT + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeZ = 1;
+#else
+		VertexShader = PostProcessVS;
+		PixelShader = HAnSBoxBlurVertical;
+		RenderTarget = HAnSBlurTexture;
+#endif
+		GenerateMipmaps = false;
+	}
+
+	pass HAnSDilateHorizontal {
+#if HANS_USE_COMPUTE
+		ComputeShader = HAnSMaxHorizontalCS;
+		DispatchSizeX = (HANS_ANALYSIS_WIDTH + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeY = (HANS_ANALYSIS_HEIGHT + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeZ = 1;
+#else
+		VertexShader = PostProcessVS;
+		PixelShader = HAnSMaxHorizontal;
+		RenderTarget = HAnSDilateHorizontalTexture;
+#endif
+		GenerateMipmaps = false;
+	}
+
+	pass HAnSDilateVertical {
+#if HANS_USE_COMPUTE
+		ComputeShader = HAnSMaxVerticalCS;
+		DispatchSizeX = (HANS_ANALYSIS_WIDTH + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeY = (HANS_ANALYSIS_HEIGHT + HANS_GROUP_SIZE - 1) / HANS_GROUP_SIZE;
+		DispatchSizeZ = 1;
+#else
+		VertexShader = PostProcessVS;
+		PixelShader = HAnSMaxVertical;
+		RenderTarget = HAnSDilateTexture;
+#endif
+		GenerateMipmaps = false;
+	}
+
+	pass HAnSFuse {
+		VertexShader = PostProcessVS;
+		PixelShader = HAnSBuildMap;
+		RenderTarget = HAnSMapTexture;
+		GenerateMipmaps = false;
+	}
+
 	pass MeasureAveragePictureLevel {
 		VertexShader = PostProcessVS;
 		PixelShader = MeasureAPL;
