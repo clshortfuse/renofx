@@ -1,15 +1,8 @@
-// HAnS highlight analysis module for RenoFXHDRToolkit.fx.
-//
-// This file is intentionally an .fx file so it can be distributed beside the
-// toolkit, but its implementation is emitted only when imported by RenoFX.
-// RenoFX defines RENOFX_HANS_IMPLEMENTATION after its input decoding helpers.
+// Reusable HAnS highlight-analysis include for RenoFXHDRToolkit.fx.
+// Include it after the toolkit's input-decoding and working-space helpers.
+// HANS_* options below are compile-time definitions, not ReShade UI uniforms.
 
-#if defined(RENOFX_HANS_IMPLEMENTATION)
-#ifndef RENOFX_HANS_INCLUDED
-#define RENOFX_HANS_INCLUDED 1
-
-#define HANS_MODE_OFF      0
-#define HANS_MODE_AUTO_SDR 1
+#pragma once
 
 // Analysis runs at half resolution. The maximum analysis radius of 12 texels
 // therefore represents a 24-pixel radius in the source image.
@@ -19,83 +12,11 @@
 #define HANS_GROUP_SIZE 8
 #define HANS_TILE_EXTENT (HANS_GROUP_SIZE + 2 * HANS_MAX_RADIUS)
 
-// Override HANS_USE_COMPUTE in ReShade's preprocessor definitions to select
-// the filtering implementation explicitly: 0 = pixel, 1 = compute. By
-// default, D3D11/D3D12 use compute and other renderers use pixel shaders.
-#ifndef HANS_USE_COMPUTE
-	#if __RENDERER__ >= 0xb000 && __RENDERER__ < 0xd000
-		#define HANS_USE_COMPUTE 1
-	#else
-		#define HANS_USE_COMPUTE 0
-	#endif
+#if __RENDERER__ >= 0xb000 && __RENDERER__ < 0xd000
+	#define HANS_USE_COMPUTE 1
+#else
+	#define HANS_USE_COMPUTE 0
 #endif
-
-uniform uint HANS_MODE <
-	ui_type = "combo";
-	ui_category = "HAnS Highlight Analysis";
-	ui_items = "Off\0Auto (SDR Input)\0";
-	ui_label = "Highlight Analysis";
-	ui_tooltip = "Controls per-pixel HDR Boost using the HAnS highlight detector. Auto analyzes SDR input and bypasses native HDR. Active HAnS bypasses the global APL limiter.";
-> = HANS_MODE_AUTO_SDR;
-
-uniform float HANS_SIZE <
-	ui_type = "slider";
-	ui_category = "HAnS Highlight Analysis";
-	ui_min = 2.0;
-	ui_max = 24.0;
-	ui_step = 2.0;
-	ui_units = " px radius";
-	ui_label = "Highlight Size";
-	ui_tooltip = "Sets the source-image radius used by HAnS. Smaller values select small highlights; larger values also admit broader highlights.";
-> = 24.0;
-
-uniform float HANS_LOCAL_CONTRAST_THRESHOLD <
-	ui_type = "slider";
-	ui_category = "HAnS Highlight Analysis";
-	ui_min = 0.0;
-	ui_max = 0.5;
-	ui_step = 0.01;
-	ui_label = "Local Contrast Threshold";
-	ui_tooltip = "Sets how strongly a candidate must stand above its surroundings. The HAnS paper commonly uses 0.2 or 0.3 for normalized LDR input.";
-> = 0.25;
-
-uniform float HANS_STRENGTH <
-	ui_type = "slider";
-	ui_category = "HAnS Highlight Analysis";
-	ui_min = 0.0;
-	ui_max = 100.0;
-	ui_step = 1.0;
-	ui_label = "Analysis Strength";
-	ui_tooltip = "Blends between unrestricted HDR Boost and HAnS per-pixel control.";
-> = 100.0;
-
-uniform float HANS_FLOOR <
-	ui_type = "slider";
-	ui_category = "HAnS Highlight Analysis";
-	ui_min = 0.0;
-	ui_max = 100.0;
-	ui_step = 1.0;
-	ui_label = "Non-Highlight Boost";
-	ui_tooltip = "Sets minimum HDR Boost availability for pixels HAnS does not identify as highlights.";
-> = 20.0;
-
-uniform float HANS_RESPONSE_GAMMA <
-	ui_type = "slider";
-	ui_category = "HAnS Highlight Analysis";
-	ui_min = 0.1;
-	ui_max = 4.0;
-	ui_step = 0.1;
-	ui_label = "Map Response";
-	ui_tooltip = "Shapes the HAnS confidence map. Lower values admit weaker detections; higher values prioritize stronger highlights.";
-> = 1.0;
-
-uniform uint HANS_DEBUG_VIEW <
-	ui_type = "combo";
-	ui_category = "HAnS Highlight Analysis";
-	ui_items = "Off\0Input Features\0Moving Average\0Dilated Average\0Local Contrast\0Feature Maps\0Fused Map\0Final Availability\0";
-	ui_label = "Debug View";
-	ui_tooltip = "Displays intermediate HAnS data. RGB views contain the selected analysis space's minimum component, luminance, and maximum component respectively.";
-> = 0;
 
 texture2D HAnSFeatureTexture {
 	Width = HANS_ANALYSIS_WIDTH;
@@ -230,7 +151,7 @@ float4 HAnSExtractFeatures(
 	float minimum = min(analysis.r, min(analysis.g, analysis.b));
 	// Match the paper's display-referred method using gamma-encoded RGB and
 	// modern BT.709 luma coefficients.
-	float luma = WorkingLuminance(analysis, SPACE_BT709);
+	float luma = renodx::color::WorkingLuminance(analysis, SPACE_BT709);
 	luma = saturate(luma);
 	float maximum = max(analysis.r, max(analysis.g, analysis.b));
 	return float4(minimum, luma, maximum, 1.0f);
@@ -530,5 +451,3 @@ float3 HAnSDebugColor(float2 texcoord, float final_availability) {
 	return 0.0f.xxx;
 }
 
-#endif
-#endif

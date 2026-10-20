@@ -4,6 +4,12 @@ This repository contains a ReShade FX shader that grades SDR or native HDR input
 
 The main implementation is `Shaders/RenoFXHDRToolkit.fx`.
 
+The toolkit menu uses the compile-time `RENOFX_MENU_MODE` selector: `0` Auto (default), `1` SDR, `2` HDR. Auto follows input color-space metadata, then target format/bit depth, and falls back to SDR if unknown. SDR mode omits input/output transfer controls and UI Brightness, fixes input/output transfer to sRGB, disables HDR Boost and HAnS, and labels the main technique `RenoFX SDR Toolkit`. HDR mode exposes input/output, HDR Boost, the HAnS Highlight Analysis controls, and gamut-expansion controls. HAnS uniforms belong in `RenoFXHDRToolkit.fx`; keep menu uniforms out of implementation includes. The presentation gamut-compression toggle always selects BT.709 in SDR mode and BT.2020 in HDR mode; do not add a separate target selector.
+
+Place reusable shader code in domain-specific `.fxh` files under `Shaders/renofx__includes/`, following RenoDX's aggregate-plus-submodule layout. `RenoFXColor.fxh` is the public aggregate include; reusable color operations are split under `color/`, tone-mapper implementations under `tonemap/`, and inverse-tone-map implementations under `inverse_tonemap/`. Each domain has a small aggregate include to collect its submodules. ReShade FX supports nested namespaces: use `renodx::color`, `renodx::tonemap`, and `renodx::inverse_tonemap` to group public functions and avoid collisions. Color includes own matrices, transfer functions, working-space conversions, OKLab/Yf operations, Bradford adaptation, and gamut/hue geometry. Tone-map includes own generic curves and working-space application; inverse-tone-map includes own HDR Boost curves. Keep shader-specific uniforms, pass scheduling, transfer selection, and goal-specific sequencing in the owning `.fx` file; pass settings into shared functions rather than making helper includes depend on effect uniforms. In effect shaders, retain the UI-to-parameter mapping and calls that compose helper functions into the pipeline, not duplicate color algorithms.
+
+`RenoFXHDRtoSDRCompatibilitySandwich.fx` implements the **SDR Compatibility Sandwich** with a default-on reversible BT.709 gamut-compression bridge. Define `RENOFX_SDR_COMPATIBILITY_GAMUT_COMPRESSION=0` to disable the forward compression and inverse restoration; it defaults to `1`. Its Before technique computes and stores a per-pixel gamut-compression scale, applies that compression, then computes and applies Neutwo. Its After technique reverses Neutwo first, then inverts the cached gamut-compression scale before restoring the original transfer. Keep the cached scales and their pass order synchronized when changing the sandwich.
+
 ## Core Representation
 
 The processing pipeline uses **linear BT.709 RGB normalized to the configured input reference white** as its common internal representation.
@@ -18,7 +24,7 @@ Do not insert unexplained transfer encoding, gamut conversion, or nit scaling in
 ## High-Level Frame Flow
 
 The original `RenoFX` frame flow consists of four passes. Six preceding
-half-resolution HAnS passes imported from `Shaders/RenoFXHAnS.fx` build a
+half-resolution HAnS passes imported from `Shaders/renofx__includes/RenoFXHAnS.fxh` build a
 per-pixel highlight map. ReShade FX does not support runtime conditions on
 individual passes, so Off bypasses HAnS output but cannot omit the scheduled
 draws/dispatches. All HAnS shaders must return before texture sampling and
@@ -30,9 +36,8 @@ filtering when analysis is disabled:
 4. `HAnSFuse` calculates positive local contrast, applies the $p=20$ sigmoid and absolute-intensity weighting, then stores the fused map in red and the three feature maps in GBA.
 
 Feature extraction and fusion are fullscreen pixel passes. The four spatial
-filters default to compute on D3D11/D3D12 and pixel shaders elsewhere;
-`HANS_USE_COMPUTE=0` or `1` overrides that choice through ReShade's
-preprocessor definitions. The filters are separable and process all three HAnS branches in one
+filters select compute on D3D11/D3D12 and pixel shaders elsewhere. The filters
+are separable and process all three HAnS branches in one
 packed RGB sample. `HANS_MAX_RADIUS` bounds the dynamic loops and compute tile
 halos; analysis is at
 half resolution, so `HANS_SIZE` is converted from source-pixel radius to
@@ -40,10 +45,12 @@ analysis texels.
 
 `Main` combines `HAnSLocalAvailability(texcoord)` with the frame-global APL
 availability and passes the product to `ApplyControls`. HAnS therefore affects
-HDR Boost only; grading, Neutwo, gamut compression, and presentation remain
-independent. Auto mode bypasses HAnS for HDR10/scRGB input. The analysis copy is
-clamped and converted to sRGB, but the scene-processing source remains linear
-and unclamped.
+HDR Boost only; grading, tone mapping, gamut compression, and presentation remain
+independent. Compile-time `HANS_*` definitions configure the analyzer; Auto mode
+bypasses HAnS for HDR10/scRGB input. The analysis copy is clamped and converted
+to sRGB, but the scene-processing source remains linear and unclamped.
+
+`RenoFXHDRToolkit.fx` declares the HDR-only HAnS UI uniforms and includes `renofx__includes/RenoFXHAnS.fxh` after its input-decoding and working-space helpers. The include provides the implementation and fixed resource/compute constants; it is not an independently enabled effect.
 
 1. **`MeasureAveragePictureLevel`** calls `MeasureAPL`.
    - Decodes the back buffer with `DecodeInput`.
@@ -52,8 +59,9 @@ and unclamped.
    - The last mip is later read as scene APL for the HDR Boost limiter.
 
 2. **`BuildFrameState`** calls `CacheFrameState`.
-   - Writes four frame-global records into `FrameStateTexture`.
+   - Writes five frame-global records into `FrameStateTexture`.
    - Caches estimated peak white, APL-dependent boost availability, peak-overlay data, color-temperature adaptation, intermediate transfer/scaling metadata, target capabilities, and a frame/dimension handshake.
+   - Caches normalized `MAX_INPUT_WHITE_NITS / INPUT_SCALING_NITS` and the matching C-infinity ramp value in texel 4 for reuse by the composite shader.
 
 3. **`Composite`** calls `Main` into `SplitIntermediateTexture` (`RGBA16F`).
    - Decodes the source into normalized linear BT.709.
@@ -96,7 +104,7 @@ The `RenoFXOutput` technique runs after downstream UI and other effects:
 
 Final output is divided into two stages:
 
-1. `PrepareOutputLinear` applies Neutwo tone mapping, optional SDR EOTF emulation, and color-temperature adaptation while still in linear BT.709.
+1. `PrepareOutputLinear` applies the selected Neutwo or clipped C-infinity tone mapper, optional SDR EOTF emulation, and color-temperature adaptation while still in linear BT.709.
 2. `EncodePresentation` applies output-gamut compression and encodes Linear, sRGB, Gamma 2.2, BT.1886, HDR10/PQ, or scRGB using the supplied reference-white nits.
 
 Keep this separation intact: scene processing should not depend on the final display encoding unless the operation explicitly models display behavior.
@@ -115,10 +123,12 @@ Keep this separation intact: scene processing should not depend on the final dis
 
 ### Grading
 
-- `ApplyBrightnessGradingShaping` handles highlights, shadows, contrast, and flare.
-- `ApplyColorGrading` handles saturation, highlight saturation, and blowout.
-- `ApplyGradingYf` provides the luminance-preserving grading path.
+- `ApplyBrightnessGradingShaping` applies RenoDX Prism's anchored C-infinity contrast, flare, highlight/shadow contrast, and highlight/shadow tonal shaping in the selected `GRADING_SPACE`; `GRADING_MID_GRAY` is both input and output anchor.
+- `ApplyColorGrading` applies global saturation, the 10,000-nit highlight-saturation rolloff, and luminance-anchored blowout before tonal shaping.
+- `ApplyGradingYf` retains the luminance-only path, with supported chroma controls applied before the C-infinity brightness shaping.
 - Global saturation can use OKLab or working-space Yf depending on `SATURATION_SPACE`.
+
+The UI controls are normalized around 50 (`value * 0.02`) so 50 maps to the C-infinity neutral value 1.0. Highlight Contrast and Shadow Contrast also default to 50. Preserve RenoFX's selected working spaces, hue restoration, and combined HDR Boost/brightness optimization. This port intentionally does not include Prism exposure or shoulder processing; those remain handled by the existing RenoFX input/output and tone-mapping stages.
 
 When HDR Boost and brightness grading use the same non-Yf space with full gamut expansion, `ApplyCombinedBrightnessShaping` chains both and performs LMS hue restoration only once. Preserve this optimization and its color behavior when changing either stage.
 
@@ -133,14 +143,14 @@ The restoration path is intentionally limited to `SPACE_LMS` by `RestoreWorkingH
 `EstimatePeakWhiteBT709` evaluates configured maximum input white through HDR Boost and brightness grading. The result is cached in grading space and used for:
 
 - highlight saturation and blowout behavior,
-- deriving Neutwo's white clip,
+- deriving the tone mapper's white clip,
 - the optional estimated-peak overlay.
 
-`ApplyNeutwo` supports per-channel working spaces, Yf, and brightest-channel modes. For HDR output, its target peak is `TONEMAP_PEAK_NITS / GAME_BRIGHTNESS_NITS`. SDR EOTF emulation modifies the effective tone-map peak so tone mapping and later gamma correction remain consistent.
+`ApplyNeutwo` and `ApplyCInfinityRollOff` support per-channel working spaces, Yf, and brightest-channel modes. C-infinity Roll-off uses an anchor of 0.18 and compression strength of 1.5; it maps Max Input White to the selected output peak and remains flat above that white clip. For HDR output, the target peak is `TONEMAP_PEAK_NITS / GAME_BRIGHTNESS_NITS`. SDR EOTF emulation modifies the effective tone-map peak so tone mapping and later gamma correction remain consistent.
 
 ## Gamut Compression
 
-`ApplyGamutCompression` runs immediately before presentation encoding. It targets BT.709 or BT.2020 and uses Stockman-Sharpe LMS plus MacLeod-Boynton chromaticity geometry.
+`ApplyGamutCompression` runs immediately before presentation encoding. It compresses in BT.709 in SDR menu mode or temporarily converts to BT.2020, compresses there, then converts back to BT.709 in HDR menu mode. `GAMUT_COMPRESSION_ENABLED` controls whether either target compression is applied. The internal LMS geometry uses the selected target's RGB triangle.
 
 The compressor:
 
@@ -151,6 +161,8 @@ The compressor:
 5. Converts back to linear BT.709 while approximately preserving brightness.
 
 Avoid ordinary RGB clipping before this stage; negative components can carry valid wide-gamut color information.
+
+The SDR Compatibility Sandwich is a separate reversible bridge, not the presentation compressor above. It caches a BT.709 Adaptive D65 compression scale, compresses before its Neutwo stage, and decompresses after reversing Neutwo. The `BridgeScalesTexture` stores gamut scale in R and Neutwo scale in G; setting `RENOFX_SDR_COMPATIBILITY_GAMUT_COMPRESSION=0` skips both compression and inverse operations.
 
 ## Split Scene/UI Mode
 
@@ -168,12 +180,13 @@ Be especially careful with `FRAME_COUNT`: inserted and final permutations can ob
 
 ## Persistent Texture Layouts
 
-### `FrameStateTexture` (4x1 RGBA32F)
+### `FrameStateTexture` (5x1 RGBA32F)
 
 - **Texel 0:** estimated peak white in grading space (`RGB`), APL-dependent HDR Boost availability (`A`).
 - **Texel 1:** estimated overlay peak nits (`R`), Bradford color-temperature adaptation (`GBA`).
 - **Texel 2:** intermediate transfer (`R`), intermediate scaling nits (`G`), float-target flag (`B`), authoritative presentation-target metadata flag (`A`).
 - **Texel 3:** packed frame count low/high halves (`RG`), buffer width/height (`BA`).
+- **Texel 4:** normalized input peak (`R`) and peak-calibrated C-infinity ramp value (`G`).
 
 ### `OutputStateTexture` (1x1 RGBA32F)
 
@@ -182,6 +195,12 @@ Stores resolved final output transfer, packed frame count, and a validity flag f
 ### `SplitIntermediateTexture` (buffer-sized RGBA16F)
 
 Carries the processed scene or downstream scene/UI composite without clipping extended or signed values.
+
+### `BridgeScalesTexture` (`RenoFXHDRtoSDRCompatibilitySandwich.fx`, buffer-sized RG16F)
+
+- **R:** per-pixel BT.709 Adaptive D65 gamut-compression scale; set to 1 when disabled.
+- **G:** per-pixel Neutwo scale computed after gamut compression.
+Only R and G are stored and sampled. The **SDR Compatibility Sandwich (Before)** technique computes and caches these scales, applies gamut compression, then Neutwo. The **SDR Compatibility Sandwich (After)** technique reverses Neutwo before applying the inverse gamut scale. The `RENOFX_SDR_COMPATIBILITY_GAMUT_COMPRESSION` define must guard both the forward and inverse transforms.
 
 ### HAnS textures (half-resolution RGBA16F)
 

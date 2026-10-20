@@ -102,7 +102,7 @@ The resulting $M(x)\in[0,1]$ is the HAnS Highlights Map. It is continuous, not m
 
 Create:
 
-- `Shaders/RenoFXHAnS.fx` — resources, uniforms, HAnS shader functions, and reusable pass declarations/macros.
+- `Shaders/renofx__includes/RenoFXHAnS.fxh` — resources, uniforms, and reusable HAnS shader functions included by the toolkit.
 
 Modify:
 
@@ -111,7 +111,7 @@ Modify:
 
 The module should be imported with a preprocessor include rather than enabled as an independently ordered ReShade technique. Correct ordering relative to `BuildFrameState` and `Composite` is required, while ReShade users can reorder separate techniques. The included module can own textures, samplers, uniforms, pixel shaders, and pass-body macros; `RenoFXHDRToolkit.fx` should own the final technique order.
 
-If ReShade FX rejects pass macros or they make diagnostics difficult, keep all HAnS resources and pixel shaders in `RenoFXHAnS.fx` and write the small pass declarations directly inside the `RenoFX` technique.
+If ReShade FX rejects pass macros or they make diagnostics difficult, keep all HAnS resources and pixel shaders in `renofx__includes/RenoFXHAnS.fxh` and write the small pass declarations directly inside the `RenoFX` technique.
 
 ## Input-Domain Policy
 
@@ -502,7 +502,7 @@ Measure GPU time at 1080p, 1440p, and 4K for full, half, and quarter resolution.
 
 ### Phase 1 — Faithful module and debug output
 
-- Create `Shaders/RenoFXHAnS.fx`.
+- Create `Shaders/renofx__includes/RenoFXHAnS.fxh`.
 - Add packed feature extraction.
 - Add separable moving average.
 - Add separable dilation.
